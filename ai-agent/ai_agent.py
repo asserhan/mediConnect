@@ -6,6 +6,9 @@ import time
 import threading
 import sys
 import random
+import uuid
+from config.database import get_collection
+from datetime import datetime, timezone
 
 class HealthcareAI:
     def __init__(self):
@@ -33,13 +36,14 @@ class HealthcareAI:
             "allergies": None,
             "emergency_contact": None,
             "chief_complaint": None,
+            "location": None,  # <-- Add this line
             "basic_info_collected": False,
             "symptom_analysis_started": False,
             "info_complete": False
         }
         
         self.ai_name = "Dr. Sara"  # MediConnect AI Assistant name
-        
+
         # Fake doctors database
         self.doctors = [
             {
@@ -98,7 +102,11 @@ class HealthcareAI:
                 "availability": "Available now"
             }
         ]
-        
+
+        # Initialize MongoDB collections
+        self.patients_collection = get_collection('PATIENTS')
+        self.conversations_collection = get_collection('CONVERSATIONS')
+
         # System prompt for healthcare AI with patient info collection
         self.system_prompt = """
 You are Dr. Sara, MediConnect's AI healthcare assistant. You specialize in providing medical guidance through a structured approach.
@@ -355,8 +363,8 @@ CONVERSATION PHASE STATUS:
                 print("1. 📹 Video Consultation")
                 print("2. 🏥 In-Person Appointment")
                 
-                consult_choice = input("\nYour choice (1 or 2): ").strip()
-                
+                consult_choice = input("\nYour choice (1 or 2): ")
+
                 if consult_choice in ['1', '2']:
                     consultation_type = "video" if consult_choice == '1' else "in-person"
                     payment_info = self.generate_payment_link(doctor_choice, consultation_type)
@@ -397,6 +405,48 @@ CONVERSATION PHASE STATUS:
                 formatted_key = key.replace("_", " ").title()
                 print(f"{formatted_key}: {value}")
         print("="*50 + "\n")
+
+    def save_patient_info_to_db(self):
+        """Save or update patient info in MongoDB"""
+        # Use emergency_contact or a session-based fallback as patient_id
+        patient_id = str(self.patient_info.get("emergency_contact") or f"session_{id(self)}")
+        doc = {
+            "patient_id": patient_id,
+            "personal_info": {
+                "age": self.patient_info.get("age"),
+                "weight": self.patient_info.get("weight"),
+                "height": self.patient_info.get("height"),
+                "gender": self.patient_info.get("gender"),
+            },
+            "medical_info": {
+                "medical_history": self.patient_info.get("medical_history"),
+                "current_medications": self.patient_info.get("current_medications"),
+                "allergies": self.patient_info.get("allergies"),
+            },
+            "emergency_contact": self.patient_info.get("emergency_contact"),
+            "chief_complaint": self.patient_info.get("chief_complaint"),
+            "selected_doctor": self.patient_info.get("selected_doctor"),
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "is_active": True
+        }
+        self.patients_collection.update_one(
+            {"patient_id": patient_id},
+            {"$set": doc},
+            upsert=True
+        )
+
+    def save_message_to_db(self, role, content):
+        """Save each message to the conversations collection"""
+        patient_id = str(self.patient_info.get("emergency_contact") or f"session_{id(self)}")
+        doc = {
+            "conversation_id": str(uuid.uuid4()),  # Unique ID for each message
+            "patient_id": patient_id,
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now(timezone.utc)
+        }
+        self.conversations_collection.insert_one(doc)
 
     def start_conversation(self):
         """Start the healthcare conversation"""
@@ -439,32 +489,71 @@ CONVERSATION PHASE STATUS:
                 if len(self.conversation_history) > 2:  # If there's been a conversation
                     last_ai_response = self.conversation_history[-1]['content'].lower()
                     if 'connect you with' in last_ai_response or 'doctor consultation' in last_ai_response:
-                        self.display_available_doctors()
                         doctor_selection_mode = True
+                        self.display_available_doctors()
                         continue
+            
+            # Normal conversation handling
+            ai_response = self.get_ai_response(user_input)
+            
+            # Save user and AI messages to database
+            self.save_message_to_db("user", user_input)
+            self.save_message_to_db("assistant", ai_response)
+            
+            # Print AI response with delay
+            print("\n🤖 Dr. Sara is typing", end="")
+            for _ in range(3):
+                print(".", end="", flush=True)
+                time.sleep(1)
+            print("\n" + ai_response)
+            
+            # Check for patient info completeness
+            if self.patient_info["info_complete"]:
+                print("\n🟢 All necessary information has been collected.")
+                # Show doctors near the patient
+                self.display_doctors_near_patient()
+                doctor_choice = input("Please select a doctor by name: ").strip()
+                self.patient_info["selected_doctor"] = doctor_choice
+                # Now save patient info
+                self.save_patient_info_to_db()
+                print("✅ Your information has been saved and sent to the doctor.")
+                print("You can now book a consultation or exit.")
+                proceed_input = input("Your choice (yes to book/exit): ").strip().lower()
+                if proceed_input == 'yes':
+                    doctor_selection_mode = True
+                    self.display_available_doctors()
+                else:
+                    print("Thank you for using MediConnect. Stay healthy!")
+                    break
             
             # Special command to show patient info
             if user_input.lower() == 'info':
                 self.display_patient_summary()
                 continue
-            
-            # Get AI response with loading animation
-            ai_response = self.get_ai_response(user_input)
-            print(ai_response)
-            
-            print("-" * 50)
+
+    def display_doctors_near_patient(self):
+        """Display doctors who speak the patient's language (or are in their city)"""
+        patient_language = self.patient_info.get("language")
+        print("\n👨‍⚕️ Doctors near you (matching your language):")
+        found = False
+        for doctor in self.doctors:
+            if patient_language and patient_language in doctor["languages"]:
+                found = True
+                print(f"- {doctor['name']} ({doctor['specialty']}, Fee: ${doctor['consultation_fee']})")
+        if not found:
+            print("No doctors found matching your language. Showing all available doctors:")
+            self.display_available_doctors()
 
 def main():
     """Main function to run the MediConnect healthcare AI assistant"""
-    try:
-        print("🚀 Starting MediConnect Healthcare AI Assistant...")
-        healthcare_ai = HealthcareAI()
-        healthcare_ai.start_conversation()
-    except KeyboardInterrupt:
-        print("\n\nSession ended. Stay healthy with MediConnect!")
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        print("Please restart MediConnect application.")
+    print("-" * 50)
+    healthcare_ai = HealthcareAI()
+    healthcare_ai.start_conversation()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+    except KeyboardInterrupt:
+        print("\n\nSession ended. Stay healthy with MediConnect!")

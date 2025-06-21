@@ -1,0 +1,37 @@
+pytest
+
+def setup_function():
+    # Connect to the database
+    global db
+    db = connect_to_database('healthcare_ai_db')
+
+def test_connection_status():
+    assert db.is_connected() == True
+
+def test_collection_documents():
+    assert db.patients.count_documents({}) == 0
+    assert db.conversations.count_documents({}) == 0
+    assert db.doctors.count_documents({}) == 5
+    assert db.appointments.count_documents({}) == 0
+
+def test_crud_operations():
+    sample_doctors = [
+        {"name": "Doctor A", "specialty": "Cardiology"},
+        {"name": "Doctor B", "specialty": "Neurology"},
+        {"name": "Doctor C", "specialty": "Pediatrics"}
+    ]
+    sample_patients = [
+        {"name": "Patient 1", "age": 30},
+        {"name": "Patient 2", "age": 25},
+        {"name": "Patient 3", "age": 40},
+        {"name": "Patient 4", "age": 35}
+    ]
+    
+    for doctor in sample_doctors:
+        db.doctors.insert_one(doctor)
+    
+    for patient in sample_patients:
+        db.patients.insert_one(patient)
+
+    assert db.doctors.count_documents({}) == 8
+    assert db.patients.count_documents({}) == 4
