@@ -13,7 +13,7 @@ class HealthcareAI:
         load_dotenv()
         token = os.environ.get("GITHUB_TOKEN")
         endpoint = "https://models.github.ai/inference"
-        model = "openai/gpt-4.1"
+        model = "openai/gpt-4.1-mini"
         
         self.client = OpenAI(
             base_url=endpoint,
@@ -144,7 +144,7 @@ RESPONSE GUIDELINES:
 - Prioritize patient safety
 
 DOCTOR REFERRAL:
-"Based on your symptoms and medical profile, I recommend connecting you with one of our qualified doctors. Would you like a video consultation or in-person appointment?"
+When recommending a doctor consultation, ALWAYS end your response with the exact phrase: "Would you like me to show you our available doctors for consultation?"
 
 SAFETY: Always err on the side of caution.
 """
@@ -244,7 +244,7 @@ SAFETY: Always err on the side of caution.
         
         for doctor in self.doctors:
             stars = "⭐" * int(doctor["rating"]) + "☆" * (5 - int(doctor["rating"]))
-            print(f"\n{doctor['id']}. Dr. {doctor['name']}")
+            print(f"\n{doctor['id']}. {doctor['name']}")
             print(f"   🩺 Specialty: {doctor['specialty']}")
             print(f"   📅 Experience: {doctor['experience']}")
             print(f"   {stars} {doctor['rating']}/5.0 ({doctor['reviews_count']} reviews)")
@@ -253,7 +253,7 @@ SAFETY: Always err on the side of caution.
             print(f"   🟢 {doctor['availability']}")
             print("-" * 80)
         
-        print("\nPlease select a doctor by entering their number (1-5):")
+        print("\nPlease select a doctor by entering their number (1-5), or type 'back' to continue chatting:")
         return True
 
     def generate_payment_link(self, doctor_id, consultation_type="video"):
@@ -341,6 +341,10 @@ CONVERSATION PHASE STATUS:
     def handle_doctor_selection(self, user_input):
         """Handle doctor selection and payment"""
         try:
+            # Allow user to go back
+            if user_input.lower() in ['back', 'return', 'cancel']:
+                return 'back'
+                
             doctor_choice = int(user_input.strip())
             if 1 <= doctor_choice <= 5:
                 selected_doctor = self.doctors[doctor_choice - 1]
@@ -384,7 +388,7 @@ CONVERSATION PHASE STATUS:
                 print("❌ Invalid doctor selection. Please choose a number between 1-5.")
                 return False
         except ValueError:
-            print("❌ Please enter a valid number.")
+            print("❌ Please enter a valid number or 'back' to return.")
             return False
 
     def display_patient_summary(self):
@@ -397,6 +401,26 @@ CONVERSATION PHASE STATUS:
                 formatted_key = key.replace("_", " ").title()
                 print(f"{formatted_key}: {value}")
         print("="*50 + "\n")
+
+    def should_show_doctors(self, user_input, ai_response):
+        """Determine if doctors list should be shown"""
+        user_lower = user_input.lower()
+        ai_lower = ai_response.lower()
+        
+        # Check if AI response contains the trigger phrase
+        if "would you like me to show you our available doctors" in ai_lower:
+            return True
+            
+        # Check if user explicitly requests doctors
+        doctor_keywords = ['yes', 'show doctors', 'see doctors', 'available doctors', 'list doctors', 'doctors list']
+        if any(keyword in user_lower for keyword in doctor_keywords):
+            # Check if this follows a recommendation for doctor consultation
+            if len(self.conversation_history) >= 2:
+                last_ai_response = self.conversation_history[-2]['content'].lower()
+                if any(phrase in last_ai_response for phrase in ['doctor', 'consultation', 'recommend', 'connect you with']):
+                    return True
+        
+        return False
 
     def start_conversation(self):
         """Start the healthcare conversation"""
@@ -412,7 +436,7 @@ CONVERSATION PHASE STATUS:
         while True:
             # Get user input
             if doctor_selection_mode:
-                user_input = input("Select doctor (1-5): ").strip()
+                user_input = input("Select doctor (1-5) or 'back': ").strip()
             else:
                 user_input = input("You: ").strip()
             
@@ -427,30 +451,38 @@ CONVERSATION PHASE STATUS:
             
             # Handle doctor selection mode
             if doctor_selection_mode:
-                if self.handle_doctor_selection(user_input):
+                result = self.handle_doctor_selection(user_input)
+                if result == 'back':
+                    doctor_selection_mode = False
+                    print("\n" + "-"*50)
+                    print("You're back to chatting with Dr. Sara. How can I help you further?")
+                    print("-"*50)
+                elif result:
                     doctor_selection_mode = False
                     print("\n" + "-"*50)
                     print("Is there anything else Dr. Sara can help you with?")
                     print("-"*50)
                 continue
             
-            # Check for doctor consultation requests
-            if any(keyword in user_input.lower() for keyword in ['yes', 'doctor', 'appointment', 'consultation']):
-                if len(self.conversation_history) > 2:  # If there's been a conversation
-                    last_ai_response = self.conversation_history[-1]['content'].lower()
-                    if 'connect you with' in last_ai_response or 'doctor consultation' in last_ai_response:
-                        self.display_available_doctors()
-                        doctor_selection_mode = True
-                        continue
-            
             # Special command to show patient info
             if user_input.lower() == 'info':
                 self.display_patient_summary()
+                continue
+                
+            # Special command to force show doctors
+            if user_input.lower() in ['doctors', 'show doctors', 'list doctors']:
+                self.display_available_doctors()
+                doctor_selection_mode = True
                 continue
             
             # Get AI response with loading animation
             ai_response = self.get_ai_response(user_input)
             print(ai_response)
+            
+            # Check if doctors list should be shown
+            if self.should_show_doctors(user_input, ai_response):
+                self.display_available_doctors()
+                doctor_selection_mode = True
             
             print("-" * 50)
 
