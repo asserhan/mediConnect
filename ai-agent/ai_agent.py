@@ -368,10 +368,9 @@ CONVERSATION PHASE STATUS:
                         print(f"Consultation Type: {consultation_type.title()}")
                         print(f"Fee: ${payment_info['doctor']['consultation_fee']}")
                         print(f"Payment ID: {payment_info['payment_id']}")
-                        print(f"Payment Link: {payment_info['payment_link']}")
+                        print(f"🔗 Payment Link: {payment_info['payment_link']}")
                         print("="*50)
-                        print("\n✅ Click the payment link above to complete your booking.")
-                        print("📱 You will receive appointment details via WhatsApp after payment.")
+                        print("\n✅ Here's your payment link to complete your booking.")
                         print("📋 Your medical information will be shared with the doctor.")
                         
                         return True
