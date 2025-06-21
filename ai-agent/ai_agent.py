@@ -2,13 +2,15 @@ import os
 from openai import OpenAI
 from dotenv import load_dotenv
 import json
+import time
+import threading
+import sys
 
 class HealthcareAI:
     def __init__(self):
         # Initialize OpenAI client
         load_dotenv()
         token = os.environ.get("GITHUB_TOKEN")
-        # print("---------TOKEN: ", token)
         endpoint = "https://models.github.ai/inference"
         model = "openai/gpt-4.1"
         
@@ -18,47 +20,176 @@ class HealthcareAI:
         )
         self.model = model
         self.conversation_history = []
-        self.user_messages_count = 0
-        self.max_free_messages = 10
         
-        # System prompt for healthcare AI
+        # Patient information tracking
+        self.patient_info = {
+            "age": None,
+            "weight": None,
+            "height": None,
+            "gender": None,
+            "medical_history": None,
+            "current_medications": None,
+            "allergies": None,
+            "emergency_contact": None,
+            "chief_complaint": None,
+            "info_complete": False
+        }
+        
+        # System prompt for healthcare AI with patient info collection
         self.system_prompt = """
-You are a healthcare AI assistant specialized in providing medical guidance. Follow these rules:
+You are a healthcare AI assistant specialized in providing medical guidance. You must collect essential patient information before providing any medical advice.
 
-1. ASSESSMENT LEVELS:
-   - SIMPLE: Common minor issues (cold, headache, minor cuts, basic nutrition questions)
-   - MODERATE: Symptoms that need professional evaluation (persistent pain, unusual symptoms, medication questions)
-   - URGENT: Serious symptoms requiring immediate medical attention
+PATIENT INFO COLLECTION PHASE:
+Before giving any medical advice, you MUST collect these details one by one in a conversational manner:
+1. Age
+2. Weight (kg) and Height (cm) 
+3. Gender
+4. Current chief complaint (main health concern)
+5. Any chronic diseases or medical conditions
+6. Current medications being taken
+7. Known allergies (food, drug, environmental)
+8. Emergency contact information
 
-2. RESPONSE GUIDELINES:
-   - For SIMPLE issues: Provide helpful advice, home remedies, when to see a doctor
-   - For MODERATE issues: Give basic guidance, then ask if they want doctor consultation
-   - For URGENT issues: Advise immediate medical attention and offer emergency consultation
+COLLECTION RULES:
+- Ask for ONE piece of information at a time in a friendly, conversational way
+- Don't overwhelm the patient with multiple questions at once
+- Make the questions feel natural, not like a form
+- Explain why you need each piece of information when relevant
+- Be patient and understanding if they don't want to share certain information
 
-3. ALWAYS:
-   - Ask relevant follow-up questions to understand symptoms better
-   - Be empathetic and supportive
-   - Include disclaimers that you're not replacing professional medical advice
-   - Suggest doctor consultation when appropriate
-   - End responses with asking if they need anything else
+ASSESSMENT LEVELS (only after info collection):
+- SIMPLE: Common minor issues that can be managed with basic advice
+- MODERATE: Symptoms needing professional evaluation
+- URGENT: Serious symptoms requiring immediate medical attention
 
-4. DOCTOR REFERRAL FORMAT:
-   When suggesting doctor consultation, say: "Would you like me to connect you with a qualified doctor for a video consultation or in-person appointment?"
+RESPONSE GUIDELINES (only after info collection):
+- For SIMPLE issues: Provide personalized advice based on their profile
+- For MODERATE issues: Give guidance, then offer doctor consultation
+- For URGENT issues: Advise immediate medical attention
 
-5. SAFETY: Always err on the side of caution. If unsure, recommend professional consultation.
+ALWAYS:
+- Be empathetic and professional
+- Use the patient's information to personalize your responses
+- Include medical disclaimers
+- Ask follow-up questions to understand symptoms better
+- Consider their age, weight, medical history in your advice
+
+DOCTOR REFERRAL:
+When suggesting consultation: "Based on your symptoms and medical profile, I recommend connecting you with a qualified doctor. Would you like a video consultation or in-person appointment?"
+
+SAFETY: Always prioritize patient safety and err on the side of caution.
 """
+
+    def show_loading_animation(self, duration=3):
+        """Show loading animation while AI processes"""
+        loading_chars = "|/-\\"
+        end_time = time.time() + duration
+        
+        sys.stdout.write("🤖 AI Assistant is thinking")
+        while time.time() < end_time:
+            for char in loading_chars:
+                sys.stdout.write(f"\r🤖 AI Assistant is thinking {char}")
+                sys.stdout.flush()
+                time.sleep(0.2)
+        
+        sys.stdout.write("\r🤖 AI Assistant: ")
+        sys.stdout.flush()
+
+    def get_patient_info_status(self):
+        """Check which patient information is still needed"""
+        missing_info = []
+        info_mapping = {
+            "age": "your age",
+            "weight": "your weight and height", 
+            "gender": "your gender",
+            "chief_complaint": "your main health concern",
+            "medical_history": "any chronic conditions or past medical history",
+            "current_medications": "current medications you're taking",
+            "allergies": "any known allergies",
+            "emergency_contact": "emergency contact information"
+        }
+        
+        for key, description in info_mapping.items():
+            if not self.patient_info[key]:
+                missing_info.append(description)
+        
+        return missing_info
+
+    def update_patient_info(self, user_message, ai_response):
+        """Extract and update patient information from conversation"""
+        user_lower = user_message.lower()
+        
+        # Age detection
+        if not self.patient_info["age"] and any(word in user_lower for word in ["years old", "age", "born"]):
+            import re
+            age_match = re.search(r'\b(\d{1,3})\b', user_message)
+            if age_match:
+                age = int(age_match.group(1))
+                if 1 <= age <= 120:
+                    self.patient_info["age"] = age
+
+        # Weight/Height detection
+        if not self.patient_info["weight"] and any(word in user_lower for word in ["kg", "weight", "weigh"]):
+            import re
+            weight_match = re.search(r'(\d+\.?\d*)\s*kg', user_message)
+            if weight_match:
+                self.patient_info["weight"] = float(weight_match.group(1))
+        
+        # Gender detection
+        if not self.patient_info["gender"] and any(word in user_lower for word in ["male", "female", "man", "woman"]):
+            if any(word in user_lower for word in ["male", "man"]):
+                self.patient_info["gender"] = "Male"
+            elif any(word in user_lower for word in ["female", "woman"]):
+                self.patient_info["gender"] = "Female"
+
+        # Chief complaint (main concern)
+        if not self.patient_info["chief_complaint"] and any(word in user_lower for word in ["pain", "hurt", "sick", "problem", "issue", "feel"]):
+            self.patient_info["chief_complaint"] = user_message
+
+        # Check if basic info is complete
+        basic_info_complete = all([
+            self.patient_info["age"],
+            self.patient_info["gender"],
+            self.patient_info["chief_complaint"]
+        ])
+        
+        if basic_info_complete and len(self.get_patient_info_status()) <= 3:
+            self.patient_info["info_complete"] = True
 
     def get_ai_response(self, user_message):
         """Get response from AI based on user's health concern"""
         try:
+            # Show loading animation in a separate thread
+            loading_thread = threading.Thread(target=self.show_loading_animation, args=(2,))
+            loading_thread.daemon = True
+            loading_thread.start()
+            
             # Add user message to conversation history
             self.conversation_history.append({
                 "role": "user", 
                 "content": user_message
             })
             
+            # Create patient info context
+            patient_context = f"""
+PATIENT INFORMATION COLLECTED:
+- Age: {self.patient_info['age'] or 'Not provided'}
+- Weight: {self.patient_info['weight'] or 'Not provided'} kg
+- Height: {self.patient_info['height'] or 'Not provided'} cm
+- Gender: {self.patient_info['gender'] or 'Not provided'}
+- Chief Complaint: {self.patient_info['chief_complaint'] or 'Not provided'}
+- Medical History: {self.patient_info['medical_history'] or 'Not provided'}
+- Current Medications: {self.patient_info['current_medications'] or 'Not provided'}
+- Allergies: {self.patient_info['allergies'] or 'Not provided'}
+- Info Collection Complete: {self.patient_info['info_complete']}
+
+Missing Information: {', '.join(self.get_patient_info_status()) if not self.patient_info['info_complete'] else 'None'}
+"""
+            
             # Create full conversation context
-            messages = [{"role": "system", "content": self.system_prompt}] + self.conversation_history
+            messages = [
+                {"role": "system", "content": self.system_prompt + "\n\n" + patient_context}
+            ] + self.conversation_history
             
             response = self.client.chat.completions.create(
                 messages=messages,
@@ -70,70 +201,69 @@ You are a healthcare AI assistant specialized in providing medical guidance. Fol
             
             ai_response = response.choices[0].message.content
             
+            # Wait for loading animation to finish
+            loading_thread.join()
+            
             # Add AI response to conversation history
             self.conversation_history.append({
                 "role": "assistant",
                 "content": ai_response
             })
             
+            # Update patient info based on conversation
+            self.update_patient_info(user_message, ai_response)
+            
             return ai_response
             
         except Exception as e:
             return f"I'm sorry, I'm experiencing technical difficulties. Please try again later. Error: {str(e)}"
 
-    def check_message_limit(self):
-        """Check if user has exceeded free message limit"""
-        if self.user_messages_count >= self.max_free_messages:
-            return False
-        return True
-
     def handle_doctor_request(self, user_wants_doctor=True):
         """Handle doctor consultation request"""
         if user_wants_doctor:
             return {
-                "message": "Great! I can help you with that. Please choose an option:\n\n1. 📹 Video Consultation ($25-50) - Available within 2 hours\n2. 🏥 In-Person Appointment ($40-80) - Available today or tomorrow\n\nWhich would you prefer?",
+                "message": f"Perfect! Based on your profile (Age: {self.patient_info['age']}, Gender: {self.patient_info['gender']}), I'll connect you with an appropriate specialist.\n\nPlease choose:\n\n1. 📹 Video Consultation ($25-50) - Available within 2 hours\n2. 🏥 In-Person Appointment ($40-80) - Available today or tomorrow\n\nWhich would you prefer?",
                 "needs_payment": True,
                 "consultation_type": "pending"
             }
         else:
             return {
-                "message": "No problem! Is there anything else I can help you with regarding your health concern?",
+                "message": "No problem! Is there anything else about your health that you'd like to discuss?",
                 "needs_payment": False
             }
+
+    def display_patient_summary(self):
+        """Display collected patient information"""
+        print("\n" + "="*50)
+        print("📋 PATIENT INFORMATION SUMMARY")
+        print("="*50)
+        for key, value in self.patient_info.items():
+            if key != "info_complete" and value:
+                formatted_key = key.replace("_", " ").title()
+                print(f"{formatted_key}: {value}")
+        print("="*50 + "\n")
 
     def start_conversation(self):
         """Start the healthcare conversation"""
         print("🏥 Healthcare AI Assistant")
         print("=" * 40)
         print("Hello! I'm your personal healthcare assistant.")
-        print(f"You have {self.max_free_messages - self.user_messages_count} free messages remaining.")
-        print("Please describe your health concern, and I'll do my best to help you.\n")
+        print("To provide you with the best possible care, I'll need to gather some important information about you first.")
+        print("This helps me give you personalized and safe medical guidance.")
+        print("Let's start - what brings you here today? What's your main health concern?\n")
         
         while True:
-            # Check message limit
-            if not self.check_message_limit():
-                print("\n⚠️  You've reached your free message limit.")
-                print("To continue chatting, please upgrade to our Basic Plan ($5/month) or pay $0.10 per message.")
-                upgrade = input("Would you like to upgrade? (yes/no): ").lower().strip()
-                if upgrade == 'yes':
-                    print("Redirecting to payment... [Payment link would be generated here]")
-                    self.max_free_messages += 50  # Simulate upgrade
-                    print("✅ Upgraded successfully! You now have 50 more messages.")
-                else:
-                    print("Thank you for using our service. Have a healthy day!")
-                    break
-            
             # Get user input
             user_input = input("You: ").strip()
             
             if user_input.lower() in ['quit', 'exit', 'bye']:
-                print("Thank you for using Healthcare AI Assistant. Take care!")
+                if any(self.patient_info.values()):
+                    self.display_patient_summary()
+                print("Thank you for using Healthcare AI Assistant. Take care and stay healthy!")
                 break
             
             if not user_input:
                 continue
-                
-            self.user_messages_count += 1
             
             # Check for doctor consultation requests
             if any(keyword in user_input.lower() for keyword in ['yes', 'doctor', 'appointment', 'consultation']):
@@ -149,19 +279,30 @@ You are a healthcare AI assistant specialized in providing medical guidance. Fol
                                 print("\n💳 Processing video consultation booking...")
                                 print("Payment link: https://yourapp.com/pay/video-consultation")
                                 print("Once payment is confirmed, you'll receive a video call link within 2 hours.")
+                                print("Your patient information will be shared with the doctor before the consultation.")
                             elif choice == '2':
                                 print("\n💳 Processing in-person appointment booking...")
                                 print("Payment link: https://yourapp.com/pay/in-person-appointment")
                                 print("Once payment is confirmed, you'll receive appointment details via WhatsApp.")
+                                print("Your patient information will be shared with the doctor before the appointment.")
                             else:
                                 print("Please choose 1 or 2.")
                         continue
             
-            # Get AI response
-            print("\n🤖 AI Assistant: ", end="")
+            # Special command to show patient info
+            if user_input.lower() == 'info':
+                self.display_patient_summary()
+                continue
+            
+            # Get AI response with loading animation
             ai_response = self.get_ai_response(user_input)
             print(ai_response)
-            print(f"\n💬 Messages remaining: {self.max_free_messages - self.user_messages_count}")
+            
+            # Show progress on info collection
+            if not self.patient_info['info_complete']:
+                missing_count = len(self.get_patient_info_status())
+                print(f"\n📊 Information Progress: {8-missing_count}/8 collected")
+            
             print("-" * 50)
 
 def main():
