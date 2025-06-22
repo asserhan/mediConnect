@@ -16,7 +16,7 @@ class HealthcareAI:
         load_dotenv()
         token = os.environ.get("GITHUB_TOKEN")
         endpoint = "https://models.github.ai/inference"
-        model = "openai/gpt-4.1"
+        model = "openai/gpt-4o"
         
         self.client = OpenAI(
             base_url=endpoint,
@@ -25,8 +25,9 @@ class HealthcareAI:
         self.model = model
         self.conversation_history = []
         
-        # Patient information tracking
+        # Patient information tracking - ADDED NAME
         self.patient_info = {
+            "name": None,  # NEW FIELD
             "age": None,
             "weight": None,
             "height": None,
@@ -36,10 +37,13 @@ class HealthcareAI:
             "allergies": None,
             "emergency_contact": None,
             "chief_complaint": None,
-            "location": None,  # <-- Add this line
+            "location": None,
+            "selected_doctor_id": None,  # Track selected doctor ID
+            "selected_doctor_name": None,  # Track selected doctor name
             "basic_info_collected": False,
             "symptom_analysis_started": False,
-            "info_complete": False
+            "info_complete": False,
+            "waiting_for_doctor_selection": False  # NEW FLAG
         }
         
         self.ai_name = "Dr. Sara"  # MediConnect AI Assistant name
@@ -106,8 +110,9 @@ class HealthcareAI:
         # Initialize MongoDB collections
         self.patients_collection = get_collection('PATIENTS')
         self.conversations_collection = get_collection('CONVERSATIONS')
+        self.doctor_patients_collection = get_collection('DOCTOR_PATIENTS')  # NEW COLLECTION
 
-        # System prompt for healthcare AI with patient info collection
+        # UPDATED System prompt - now includes name collection
         self.system_prompt = """
 You are Dr. Sara, MediConnect's AI healthcare assistant. You specialize in providing medical guidance through a structured approach.
 
@@ -116,13 +121,14 @@ CONVERSATION PHASES:
 PHASE 1: BASIC INFO COLLECTION (if not collected)
 Collect ALL basic information in ONE response:
 "Hello! I'm Dr. Sara from MediConnect. To provide you with the best care, I need some basic information:
-1. Your age
-2. Your weight (kg) and height (cm)
-3. Your gender
-4. Any chronic diseases or ongoing medical conditions
-5. Current medications you're taking
-6. Any known allergies
-7. Emergency contact information
+1. Your full name
+2. Your age
+3. Your weight (kg) and height (cm)
+4. Your gender
+5. Any chronic diseases or ongoing medical conditions
+6. Current medications you're taking
+7. Any known allergies
+8. Emergency contact information
 
 Please provide all this information so I can help you properly."
 
@@ -152,7 +158,10 @@ RESPONSE GUIDELINES:
 - Prioritize patient safety
 
 DOCTOR REFERRAL:
-"Based on your symptoms and medical profile, I recommend connecting you with one of our qualified doctors. Would you like a video consultation or in-person appointment?"
+When symptoms require professional evaluation, say:
+"Based on your symptoms and medical profile, I recommend connecting you with one of our qualified doctors. Let me show you our available doctors right now."
+
+IMPORTANT: Do NOT list doctors in your response. The system will handle doctor display separately.
 
 SAFETY: Always err on the side of caution.
 """
@@ -174,7 +183,7 @@ SAFETY: Always err on the side of caution.
 
     def get_patient_info_status(self):
         """Check which patient information is still needed"""
-        required_fields = ["age", "weight", "gender", "medical_history", "current_medications", "allergies", "emergency_contact"]
+        required_fields = ["name", "age", "weight", "gender", "medical_history", "current_medications", "allergies", "emergency_contact"]
         collected_count = sum(1 for field in required_fields if self.patient_info[field] is not None)
         total_fields = len(required_fields)
         
@@ -184,6 +193,28 @@ SAFETY: Always err on the side of caution.
         """Extract and update patient information from conversation"""
         user_lower = user_message.lower()
         
+        # Name detection - IMPROVED
+        if not self.patient_info["name"]:
+            # Look for patterns like "my name is", "I'm", "call me", etc.
+            import re
+            name_patterns = [
+                r'my name is ([a-zA-Z\s]+)',
+                r'i am ([a-zA-Z\s]+)',
+                r"i'm ([a-zA-Z\s]+)",
+                r'call me ([a-zA-Z\s]+)',
+                r'name:\s*([a-zA-Z\s]+)',
+                r'^([a-zA-Z\s]+)$'  # If message is just a name
+            ]
+            
+            for pattern in name_patterns:
+                match = re.search(pattern, user_message, re.IGNORECASE)
+                if match:
+                    potential_name = match.group(1).strip().title()
+                    # Validate name (contains letters, reasonable length)
+                    if len(potential_name) >= 2 and len(potential_name.split()) <= 4 and potential_name.replace(' ', '').isalpha():
+                        self.patient_info["name"] = potential_name
+                        break
+
         # Age detection
         if not self.patient_info["age"] and any(word in user_lower for word in ["years old", "age", "born", "year old"]):
             import re
@@ -212,7 +243,7 @@ SAFETY: Always err on the side of caution.
                 self.patient_info["gender"] = "Female"
 
         # Medical history detection
-        if not self.patient_info["medical_history"] and any(word in user_lower for word in ["diabetes", "hypertension", "asthma", "heart", "cancer", "disease", "condition", "none", "no medical"]):
+        if not self.patient_info["medical_history"] and any(word in user_lower for word in ["diabetes", "hypertension", "asthma", "heart", "cancer", "disease", "condition", "none", "no medical", "history"]):
             self.patient_info["medical_history"] = user_message
 
         # Medications detection
@@ -234,8 +265,8 @@ SAFETY: Always err on the side of caution.
             self.patient_info["chief_complaint"] = user_message
             self.patient_info["symptom_analysis_started"] = True
 
-        # Check if basic info is complete
-        required_basic_fields = ["age", "weight", "gender", "medical_history", "current_medications", "allergies", "emergency_contact"]
+        # Check if basic info is complete - UPDATED to include name
+        required_basic_fields = ["name", "age", "weight", "gender", "medical_history", "current_medications", "allergies", "emergency_contact"]
         basic_info_complete = all(self.patient_info[field] is not None for field in required_basic_fields)
         
         if basic_info_complete and not self.patient_info["basic_info_collected"]:
@@ -244,15 +275,29 @@ SAFETY: Always err on the side of caution.
         if basic_info_complete and self.patient_info["chief_complaint"]:
             self.patient_info["info_complete"] = True
 
+    def should_show_doctors(self, ai_response):
+        """Determine if we should show the doctor list based on AI response"""
+        doctor_keywords = [
+            "recommend connecting you with",
+            "connect you with one of our qualified doctors",
+            "show you our available doctors",
+            "consult with a doctor",
+            "see a doctor",
+            "medical professional",
+            "qualified doctors"
+        ]
+        
+        return any(keyword in ai_response.lower() for keyword in doctor_keywords)
+
     def display_available_doctors(self):
-        """Display available doctors with ratings and fees"""
+        """Display available doctors with ratings and fees - ALWAYS WORKS"""
         print("\n" + "="*80)
         print("👨‍⚕️ AVAILABLE DOCTORS - MediConnect")
         print("="*80)
         
         for doctor in self.doctors:
             stars = "⭐" * int(doctor["rating"]) + "☆" * (5 - int(doctor["rating"]))
-            print(f"\n{doctor['id']}. Dr. {doctor['name']}")
+            print(f"\n{doctor['id']}. {doctor['name']}")
             print(f"   🩺 Specialty: {doctor['specialty']}")
             print(f"   📅 Experience: {doctor['experience']}")
             print(f"   {stars} {doctor['rating']}/5.0 ({doctor['reviews_count']} reviews)")
@@ -261,8 +306,70 @@ SAFETY: Always err on the side of caution.
             print(f"   🟢 {doctor['availability']}")
             print("-" * 80)
         
-        print("\nPlease select a doctor by entering their number (1-5):")
+        print("\n🔥 Please select a doctor by entering their number (1-5):")
+        self.patient_info["waiting_for_doctor_selection"] = True
         return True
+
+    def handle_doctor_selection(self, user_input):
+        """Handle doctor selection and save patient info - IMPROVED"""
+        try:
+            doctor_choice = int(user_input.strip())
+            if 1 <= doctor_choice <= 5:
+                selected_doctor = self.doctors[doctor_choice - 1]
+                
+                # Save selected doctor info
+                self.patient_info["selected_doctor_id"] = selected_doctor["id"]
+                self.patient_info["selected_doctor_name"] = selected_doctor["name"]
+                
+                print(f"\n✅ You selected: {selected_doctor['name']}")
+                print(f"💰 Consultation Fee: ${selected_doctor['consultation_fee']}")
+                print(f"⭐ Rating: {selected_doctor['rating']}/5.0")
+                print(f"🟢 {selected_doctor['availability']}")
+                
+                # SAVE PATIENT INFO TO DATABASE IMMEDIATELY
+                self.save_patient_info_to_db()
+                self.save_doctor_patient_relationship()
+                
+                print(f"\n📋 {self.patient_info['name']}'s information has been saved and sent to {selected_doctor['name']}!")
+                
+                # Ask for consultation type
+                print("\nSelect consultation type:")
+                print("1. 📹 Video Consultation")
+                print("2. 🏥 In-Person Appointment")
+                
+                consult_choice = input("\nYour choice (1 or 2): ")
+
+                if consult_choice in ['1', '2']:
+                    consultation_type = "video" if consult_choice == '1' else "in-person"
+                    payment_info = self.generate_payment_link(doctor_choice, consultation_type)
+                    
+                    if payment_info:
+                        print(f"\n💳 PAYMENT DETAILS - MediConnect")
+                        print("="*50)
+                        print(f"Patient: {self.patient_info['name']}")
+                        print(f"Doctor: {payment_info['doctor']['name']}")
+                        print(f"Consultation Type: {consultation_type.title()}")
+                        print(f"Fee: ${payment_info['doctor']['consultation_fee']}")
+                        print(f"Payment ID: {payment_info['payment_id']}")
+                        print(f"🔗 Payment Link: {payment_info['payment_link']}")
+                        print("="*50)
+                        print(f"\n✅ {self.patient_info['name']}, here's your payment link to complete your booking.")
+                        print("📋 Your medical information has been shared with the doctor.")
+                        
+                        self.patient_info["waiting_for_doctor_selection"] = False
+                        return True
+                    else:
+                        print("❌ Error generating payment information. Please try again.")
+                        return False
+                else:
+                    print("❌ Invalid choice. Please select 1 or 2.")
+                    return False
+            else:
+                print("❌ Invalid doctor selection. Please choose a number between 1-5.")
+                return False
+        except ValueError:
+            print("❌ Please enter a valid number.")
+            return False
 
     def generate_payment_link(self, doctor_id, consultation_type="video"):
         """Generate a fake payment link for the selected doctor"""
@@ -294,10 +401,11 @@ SAFETY: Always err on the side of caution.
                 "content": user_message
             })
             
-            # Create patient info context
+            # Create patient info context - UPDATED to include name
             collected_count, total_fields = self.get_patient_info_status()
             patient_context = f"""
 PATIENT INFORMATION STATUS:
+- Name: {self.patient_info['name'] or 'Not provided'}
 - Age: {self.patient_info['age'] or 'Not provided'}
 - Weight: {self.patient_info['weight'] or 'Not provided'} kg
 - Height: {self.patient_info['height'] or 'Not provided'} cm
@@ -346,73 +454,26 @@ CONVERSATION PHASE STATUS:
         except Exception as e:
             return f"I'm sorry, I'm experiencing technical difficulties. Please try again later. Error: {str(e)}"
 
-    def handle_doctor_selection(self, user_input):
-        """Handle doctor selection and payment"""
-        try:
-            doctor_choice = int(user_input.strip())
-            if 1 <= doctor_choice <= 5:
-                selected_doctor = self.doctors[doctor_choice - 1]
-                
-                print(f"\n✅ You selected: {selected_doctor['name']}")
-                print(f"💰 Consultation Fee: ${selected_doctor['consultation_fee']}")
-                print(f"⭐ Rating: {selected_doctor['rating']}/5.0")
-                print(f"🟢 {selected_doctor['availability']}")
-                
-                # Ask for consultation type
-                print("\nSelect consultation type:")
-                print("1. 📹 Video Consultation")
-                print("2. 🏥 In-Person Appointment")
-                
-                consult_choice = input("\nYour choice (1 or 2): ")
-
-                if consult_choice in ['1', '2']:
-                    consultation_type = "video" if consult_choice == '1' else "in-person"
-                    payment_info = self.generate_payment_link(doctor_choice, consultation_type)
-                    
-                    if payment_info:
-                        print(f"\n💳 PAYMENT DETAILS - MediConnect")
-                        print("="*50)
-                        print(f"Doctor: {payment_info['doctor']['name']}")
-                        print(f"Consultation Type: {consultation_type.title()}")
-                        print(f"Fee: ${payment_info['doctor']['consultation_fee']}")
-                        print(f"Payment ID: {payment_info['payment_id']}")
-                        print(f"🔗 Payment Link: {payment_info['payment_link']}")
-                        print("="*50)
-                        print("\n✅ Here's your payment link to complete your booking.")
-                        print("📋 Your medical information will be shared with the doctor.")
-                        
-                        return True
-                    else:
-                        print("❌ Error generating payment information. Please try again.")
-                        return False
-                else:
-                    print("❌ Invalid choice. Please select 1 or 2.")
-                    return False
-            else:
-                print("❌ Invalid doctor selection. Please choose a number between 1-5.")
-                return False
-        except ValueError:
-            print("❌ Please enter a valid number.")
-            return False
-
     def display_patient_summary(self):
-        """Display collected patient information"""
+        """Display collected patient information - UPDATED"""
         print("\n" + "="*50)
         print("📋 PATIENT INFORMATION SUMMARY - MediConnect")
         print("="*50)
         for key, value in self.patient_info.items():
-            if key not in ["info_complete", "basic_info_collected", "symptom_analysis_started"] and value:
+            if key not in ["info_complete", "basic_info_collected", "symptom_analysis_started", "waiting_for_doctor_selection"] and value:
                 formatted_key = key.replace("_", " ").title()
                 print(f"{formatted_key}: {value}")
         print("="*50 + "\n")
 
     def save_patient_info_to_db(self):
-        """Save or update patient info in MongoDB"""
-        # Use emergency_contact or a session-based fallback as patient_id
-        patient_id = str(self.patient_info.get("emergency_contact") or f"session_{id(self)}")
+        """Save or update patient info in MongoDB - IMPROVED"""
+        # Use name + emergency_contact as unique identifier
+        patient_id = f"{self.patient_info.get('name', 'unknown')}_{self.patient_info.get('emergency_contact', str(uuid.uuid4())[:8])}"
+        
         doc = {
             "patient_id": patient_id,
             "personal_info": {
+                "name": self.patient_info.get("name"),
                 "age": self.patient_info.get("age"),
                 "weight": self.patient_info.get("weight"),
                 "height": self.patient_info.get("height"),
@@ -425,23 +486,50 @@ CONVERSATION PHASE STATUS:
             },
             "emergency_contact": self.patient_info.get("emergency_contact"),
             "chief_complaint": self.patient_info.get("chief_complaint"),
-            "selected_doctor": self.patient_info.get("selected_doctor"),
+            "selected_doctor_id": self.patient_info.get("selected_doctor_id"),
+            "selected_doctor_name": self.patient_info.get("selected_doctor_name"),
             "created_at": datetime.now(timezone.utc),
             "updated_at": datetime.now(timezone.utc),
             "is_active": True
         }
-        self.patients_collection.update_one(
+        
+        result = self.patients_collection.update_one(
             {"patient_id": patient_id},
             {"$set": doc},
             upsert=True
         )
+        
+        print(f"💾 Patient information saved to database!")
+        return patient_id
+
+    def save_doctor_patient_relationship(self):
+        """Save the doctor-patient relationship - NEW METHOD"""
+        if self.patient_info.get("selected_doctor_id") and self.patient_info.get("name"):
+            patient_id = f"{self.patient_info.get('name')}_{self.patient_info.get('emergency_contact', str(uuid.uuid4())[:8])}"
+            
+            doc = {
+                "relationship_id": str(uuid.uuid4()),
+                "doctor_id": self.patient_info["selected_doctor_id"],
+                "doctor_name": self.patient_info["selected_doctor_name"],
+                "patient_id": patient_id,
+                "patient_name": self.patient_info["name"],
+                "patient_age": self.patient_info.get("age"),
+                "patient_gender": self.patient_info.get("gender"),
+                "chief_complaint": self.patient_info.get("chief_complaint"),
+                "assignment_date": datetime.now(timezone.utc),
+                "status": "assigned"
+            }
+            
+            self.doctor_patients_collection.insert_one(doc)
+            print(f"🏥 {self.patient_info['name']} assigned to {self.patient_info['selected_doctor_name']}!")
 
     def save_message_to_db(self, role, content):
         """Save each message to the conversations collection"""
-        patient_id = str(self.patient_info.get("emergency_contact") or f"session_{id(self)}")
+        patient_id = f"{self.patient_info.get('name', 'unknown')}_{self.patient_info.get('emergency_contact', str(uuid.uuid4())[:8])}"
         doc = {
-            "conversation_id": str(uuid.uuid4()),  # Unique ID for each message
+            "conversation_id": str(uuid.uuid4()),
             "patient_id": patient_id,
+            "patient_name": self.patient_info.get("name"),
             "role": role,
             "content": content,
             "timestamp": datetime.now(timezone.utc)
@@ -449,7 +537,7 @@ CONVERSATION PHASE STATUS:
         self.conversations_collection.insert_one(doc)
 
     def start_conversation(self):
-        """Start the healthcare conversation"""
+        """Start the healthcare conversation - UPDATED"""
         print("🏥 MediConnect - Healthcare AI Assistant")
         print("=" * 50)
         print("Hello! I'm Dr. Sara, your AI healthcare assistant from MediConnect.")
@@ -457,43 +545,30 @@ CONVERSATION PHASE STATUS:
         print("qualified doctors when needed.")
         print("\nLet's get started! Please tell me what's bothering you today.\n")
         
-        doctor_selection_mode = False
-        
         while True:
-            # Get user input
-            if doctor_selection_mode:
+            # Check if we're waiting for doctor selection
+            if self.patient_info["waiting_for_doctor_selection"]:
                 user_input = input("Select doctor (1-5): ").strip()
-            else:
-                user_input = input("You: ").strip()
-            
-            if user_input.lower() in ['quit', 'exit', 'bye']:
-                if any(self.patient_info.values()):
-                    self.display_patient_summary()
-                print("Thank you for using MediConnect! Dr. Sara wishes you good health. Take care!")
-                break
-            
-            if not user_input:
-                continue
-            
-            # Handle doctor selection mode
-            if doctor_selection_mode:
                 if self.handle_doctor_selection(user_input):
-                    doctor_selection_mode = False
                     print("\n" + "-"*50)
                     print("Is there anything else Dr. Sara can help you with?")
                     print("-"*50)
                 continue
             
-            # Check for doctor consultation requests
-            if any(keyword in user_input.lower() for keyword in ['yes', 'doctor', 'appointment', 'consultation']):
-                if len(self.conversation_history) > 2:  # If there's been a conversation
-                    last_ai_response = self.conversation_history[-1]['content'].lower()
-                    if 'connect you with' in last_ai_response or 'doctor consultation' in last_ai_response:
-                        doctor_selection_mode = True
-                        self.display_available_doctors()
-                        continue
+            # Regular input
+            user_input = input("You: ").strip()
             
-            # Normal conversation handling
+            if user_input.lower() in ['quit', 'exit', 'bye']:
+                if any(self.patient_info.values()):
+                    self.display_patient_summary()
+                patient_name = self.patient_info.get('name', 'there')
+                print(f"Thank you for using MediConnect, {patient_name}! Dr. Sara wishes you good health. Take care!")
+                break
+            
+            if not user_input:
+                continue
+            
+            # Get AI response
             ai_response = self.get_ai_response(user_input)
             
             # Save user and AI messages to database
@@ -507,42 +582,15 @@ CONVERSATION PHASE STATUS:
                 time.sleep(1)
             print("\n" + ai_response)
             
-            # Check for patient info completeness
-            if self.patient_info["info_complete"]:
-                print("\n🟢 All necessary information has been collected.")
-                # Show doctors near the patient
-                self.display_doctors_near_patient()
-                doctor_choice = input("Please select a doctor by name: ").strip()
-                self.patient_info["selected_doctor"] = doctor_choice
-                # Now save patient info
-                self.save_patient_info_to_db()
-                print("✅ Your information has been saved and sent to the doctor.")
-                print("You can now book a consultation or exit.")
-                proceed_input = input("Your choice (yes to book/exit): ").strip().lower()
-                if proceed_input == 'yes':
-                    doctor_selection_mode = True
-                    self.display_available_doctors()
-                else:
-                    print("Thank you for using MediConnect. Stay healthy!")
-                    break
+            # Check if AI response suggests showing doctors
+            if self.should_show_doctors(ai_response):
+                time.sleep(1)  # Brief pause
+                self.display_available_doctors()
             
             # Special command to show patient info
             if user_input.lower() == 'info':
                 self.display_patient_summary()
                 continue
-
-    def display_doctors_near_patient(self):
-        """Display doctors who speak the patient's language (or are in their city)"""
-        patient_language = self.patient_info.get("language")
-        print("\n👨‍⚕️ Doctors near you (matching your language):")
-        found = False
-        for doctor in self.doctors:
-            if patient_language and patient_language in doctor["languages"]:
-                found = True
-                print(f"- {doctor['name']} ({doctor['specialty']}, Fee: ${doctor['consultation_fee']})")
-        if not found:
-            print("No doctors found matching your language. Showing all available doctors:")
-            self.display_available_doctors()
 
 def main():
     """Main function to run the MediConnect healthcare AI assistant"""
